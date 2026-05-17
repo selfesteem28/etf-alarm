@@ -1,10 +1,12 @@
 """
-텔레그램 ETF 알람 봇
+텔레그램 ETF 알람 봇 v2
 GitHub Actions에서 1분마다 실행
-신호 발생 시 텔레그램으로 알람 발송
+같은 신호는 최대 3번만 발송
+신호 바뀌면 다시 카운트 시작
 """
 
 import os
+import json
 import requests
 import yfinance as yf
 import pandas as pd
@@ -17,6 +19,8 @@ KST = timezone(timedelta(hours=9))
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+STATE_FILE = "signal_state.json"
+MAX_COUNT  = 3  # 같은 신호 최대 발송 횟수
 
 MARKETS = {
     "코스닥":  {"signal_code": "229200", "trade_code": "233740", "name_signal": "KODEX 코스닥150",   "name_trade": "KODEX 코스닥150레버리지"},
@@ -24,6 +28,35 @@ MARKETS = {
     "2차전지": {"signal_code": "305720", "trade_code": "462330", "name_signal": "KODEX 2차전지산업", "name_trade": "KODEX 2차전지레버리지"},
     "반도체":  {"signal_code": "091160", "trade_code": "494310", "name_signal": "KODEX 반도체",      "name_trade": "KODEX 반도체레버리지"},
 }
+
+# ── 신호 상태 저장/불러오기 ──
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def should_send(state, mkt, signal_type):
+    """같은 신호 3번까지만 발송. 신호 바뀌면 카운트 리셋"""
+    prev_signal = state.get(mkt + "_signal", "")
+    count       = state.get(mkt + "_count", 0)
+
+    if prev_signal != signal_type:
+        # 신호 바뀜 → 리셋 후 발송
+        state[mkt + "_signal"] = signal_type
+        state[mkt + "_count"]  = 1
+        return True
+    elif count < MAX_COUNT:
+        # 같은 신호, 3번 미만 → 발송
+        state[mkt + "_count"] = count + 1
+        return True
+    else:
+        # 같은 신호, 3번 초과 → 스킵
+        return False
 
 # ── 텔레그램 발송 ──
 def send_telegram(msg):
@@ -115,22 +148,21 @@ def get_pre_alerts(sig):
     gap = sig["gap"]
     stop_dist = sig["stop_dist"]
     sma_dist  = sig["sma120_dist"]
-    if   15 < gap <= 18: alerts.append({"level":"D-1","msg":f"매수 임박! gap {gap:.1f}%"})
-    elif 18 < gap <= 22: alerts.append({"level":"D-2","msg":f"매수 접근 gap {gap:.1f}%"})
-    elif 22 < gap <= 26: alerts.append({"level":"D-3","msg":f"매수 모니터링 gap {gap:.1f}%"})
+    if   15 < gap <= 18: alerts.append({"level":"D-1","kind":"buy","msg":f"매수 임박! gap {gap:.1f}%"})
+    elif 18 < gap <= 22: alerts.append({"level":"D-2","kind":"buy","msg":f"매수 접근 gap {gap:.1f}%"})
+    elif 22 < gap <= 26: alerts.append({"level":"D-3","kind":"buy","msg":f"매수 모니터링 gap {gap:.1f}%"})
     if stop_dist is not None:
-        if   0  < stop_dist <= 2:  alerts.append({"level":"D-1","msg":f"ATR스탑 거의 도달! {stop_dist:.1f}% 남음"})
-        elif 2  < stop_dist <= 5:  alerts.append({"level":"D-2","msg":f"ATR스탑 {stop_dist:.1f}% 남음"})
-        elif 5  < stop_dist <= 10: alerts.append({"level":"D-3","msg":f"ATR스탑 {stop_dist:.1f}% 남음"})
+        if   0  < stop_dist <= 2:  alerts.append({"level":"D-1","kind":"sell","msg":f"ATR스탑 거의 도달! {stop_dist:.1f}% 남음"})
+        elif 2  < stop_dist <= 5:  alerts.append({"level":"D-2","kind":"sell","msg":f"ATR스탑 {stop_dist:.1f}% 남음"})
+        elif 5  < stop_dist <= 10: alerts.append({"level":"D-3","kind":"sell","msg":f"ATR스탑 {stop_dist:.1f}% 남음"})
     if sig["above_sma120"]:
-        if   0  < sma_dist <= 2:  alerts.append({"level":"D-1","msg":f"SMA120 이탈 직전! {sma_dist:.1f}% 남음"})
-        elif 2  < sma_dist <= 5:  alerts.append({"level":"D-2","msg":f"SMA120까지 {sma_dist:.1f}%"})
+        if   0  < sma_dist <= 2:  alerts.append({"level":"D-1","kind":"sell","msg":f"SMA120 이탈 직전! {sma_dist:.1f}% 남음"})
+        elif 2  < sma_dist <= 5:  alerts.append({"level":"D-2","kind":"sell","msg":f"SMA120까지 {sma_dist:.1f}%"})
     return alerts
 
 # ── 장중 여부 확인 ──
 def is_market_open():
     now = datetime.now(KST)
-    # 평일 09:00~15:30
     if now.weekday() >= 5:
         return False
     market_open  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
@@ -142,11 +174,11 @@ def main():
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
     print(f"실행 시각: {now_str}")
 
-    # 테스트용 임시 비활성화
-    # if not is_market_open():
-    #     print("장외 시간 - 알람 없음")
-    #     return
+    if not is_market_open():
+        print("장외 시간 - 알람 없음")
+        return
 
+    state = load_state()
     messages = []
 
     for mkt, info in MARKETS.items():
@@ -160,60 +192,71 @@ def main():
 
         pre_alerts = get_pre_alerts(sig)
 
-        # 주요 신호
+        # 주요 신호 판단
         if sig["buy_signal"]:
-            messages.append(
-                f"🔴 <b>{mkt} 매수 신호!</b>\n"
-                f"현재가: ₩{sig['price']:,.0f}\n"
-                f"SMA120: ₩{sig['sma120']:,.0f}\n"
-                f"gap: {sig['gap']:+.1f}%\n"
-                f"매매ETF: {info['name_trade']} ({info['trade_code']})"
-            )
+            signal_type = "매수"
+            if should_send(state, mkt, signal_type):
+                messages.append(
+                    f"🔴 <b>{mkt} 매수 신호!</b>\n"
+                    f"현재가: ₩{sig['price']:,.0f}\n"
+                    f"SMA120: ₩{sig['sma120']:,.0f}\n"
+                    f"gap: {sig['gap']:+.1f}%\n"
+                    f"매매ETF: {info['name_trade']} ({info['trade_code']})"
+                )
         elif sig["reentry"]:
-            messages.append(
-                f"🔴 <b>{mkt} 재진입 신호!</b>\n"
-                f"현재가: ₩{sig['price']:,.0f}\n"
-                f"gap: {sig['gap']:+.1f}%\n"
-                f"매매ETF: {info['name_trade']} ({info['trade_code']})"
-            )
+            signal_type = "재진입"
+            if should_send(state, mkt, signal_type):
+                messages.append(
+                    f"🔴 <b>{mkt} 재진입 신호!</b>\n"
+                    f"현재가: ₩{sig['price']:,.0f}\n"
+                    f"gap: {sig['gap']:+.1f}%\n"
+                    f"매매ETF: {info['name_trade']} ({info['trade_code']})"
+                )
         elif sig["atr_sell"]:
-            messages.append(
-                f"🔵 <b>{mkt} ATR 매도 신호!</b>\n"
-                f"현재가: ₩{sig['price']:,.0f}\n"
-                f"ATR스탑: ₩{sig['trail_stop']:,.0f}\n"
-                f"gap: {sig['gap']:+.1f}%\n"
-                f"매매ETF: {info['name_trade']} ({info['trade_code']})"
-            )
+            signal_type = "ATR매도"
+            if should_send(state, mkt, signal_type):
+                messages.append(
+                    f"🔵 <b>{mkt} ATR 매도 신호!</b>\n"
+                    f"현재가: ₩{sig['price']:,.0f}\n"
+                    f"ATR스탑: ₩{sig['trail_stop']:,.0f}\n"
+                    f"gap: {sig['gap']:+.1f}%\n"
+                    f"매매ETF: {info['name_trade']} ({info['trade_code']})"
+                )
         elif sig["sma_sell"]:
-            messages.append(
-                f"🔵 <b>{mkt} SMA120 매도 신호!</b>\n"
-                f"현재가: ₩{sig['price']:,.0f}\n"
-                f"SMA120: ₩{sig['sma120']:,.0f}\n"
-                f"gap: {sig['gap']:+.1f}%"
-            )
+            signal_type = "SMA매도"
+            if should_send(state, mkt, signal_type):
+                messages.append(
+                    f"🔵 <b>{mkt} SMA120 매도 신호!</b>\n"
+                    f"현재가: ₩{sig['price']:,.0f}\n"
+                    f"SMA120: ₩{sig['sma120']:,.0f}\n"
+                    f"gap: {sig['gap']:+.1f}%"
+                )
+        else:
+            signal_type = "대기"
+            state[mkt + "_signal"] = signal_type
+            state[mkt + "_count"]  = 0
 
         # 사전 경보
         for a in pre_alerts:
-            if a["level"] == "D-1":
-                icon = "🚨"
-            elif a["level"] == "D-2":
-                icon = "⚠️"
-            else:
-                icon = "📌"
-            messages.append(
-                f"{icon} <b>{mkt} [{a['level']}] 경보</b>\n"
-                f"{a['msg']}\n"
-                f"현재가: ₩{sig['price']:,.0f} | gap: {sig['gap']:+.1f}%"
-            )
+            alert_type = a["level"] + "_" + a["kind"]
+            if should_send(state, mkt, alert_type):
+                icon = "🚨" if a["level"] == "D-1" else ("⚠️" if a["level"] == "D-2" else "📌")
+                messages.append(
+                    f"{icon} <b>{mkt} [{a['level']}] 경보</b>\n"
+                    f"{a['msg']}\n"
+                    f"현재가: ₩{sig['price']:,.0f} | gap: {sig['gap']:+.1f}%"
+                )
+
+    save_state(state)
 
     if messages:
         header = f"📊 <b>ETF 알람</b> | {now_str}\n{'─'*30}\n\n"
         full_msg = header + "\n\n".join(messages)
         ok = send_telegram(full_msg)
         print(f"텔레그램 발송: {'성공' if ok else '실패'}")
-        print(f"발송 내용:\n{full_msg}")
+        print(f"발송 메시지 수: {len(messages)}")
     else:
-        print("신호 없음 - 발송 안함")
+        print("신호 없음 또는 이미 3번 발송 - 스킵")
 
 if __name__ == "__main__":
     main()
