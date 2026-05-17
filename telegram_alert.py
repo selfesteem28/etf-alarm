@@ -142,9 +142,10 @@ def main():
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
     print(f"실행 시각: {now_str}")
 
-    if not is_market_open():
-        print("장외 시간 - 알람 없음")
-        return
+    # 테스트용 임시 비활성화
+    # if not is_market_open():
+    #     print("장외 시간 - 알람 없음")
+    #     return
 
     messages = []
 
