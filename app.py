@@ -1,8 +1,10 @@
 """
-국내 레버리지 ETF 알람 시스템 v2.0
-데이터: 네이버 금융 실시간 (약 1분 지연)
-전략: SMA120 + ATR(20)x2.0 트레일링스탑 + SMA20 재진입
-저장: 브라우저 localStorage (각자 독립)
+국내 레버리지 ETF 알람 시스템 v2.1
+수정사항:
+  - sendPopupAlert JS 함수 최상단 정의 (알람 먹통 버그 수정)
+  - trail_stop 계산 로직 수정 (peak 기반 단순 계산)
+  - localStorage 저장/로드 안정화 (껐다 켜도 유지)
+  - 설정값 Tab2 자동 계산 연동
 """
 
 import streamlit as st
@@ -82,15 +84,12 @@ def calc_signal(df, rt_price=None):
     sma20  = float(df["SMA20"].iloc[-1])
     atr20  = float(df["ATR20"].iloc[-1])
     gap    = (price - sma120) / sma120 * 100
-    recent = df.tail(120).copy()
-    peak, trail_stop = None, None
-    for _, row in recent.iterrows():
-        p = float(row["price"])
-        if peak is None or p > peak:
-            peak = p
-        if gap > 20:
-            ts = peak - float(row["ATR20"]) * 2.0
-            trail_stop = ts if trail_stop is None else max(trail_stop, ts)
+
+    # ── trail_stop 수정: 최근 120일 고점 기준 단순 계산 ──
+    recent_high = float(df["price"].tail(120).max())
+    trail_stop  = recent_high - atr20 * 2.0 if gap > 20 else None
+    stop_dist   = (price - trail_stop) / price * 100 if trail_stop else None
+
     above_sma120 = price > sma120
     buy_signal   = above_sma120 and (0 < gap <= 15)
     atr_sell     = bool(trail_stop and gap > 20 and price < trail_stop)
@@ -98,8 +97,8 @@ def calc_signal(df, rt_price=None):
     prev_price   = float(df["price"].iloc[-2])
     prev_sma20   = float(df["SMA20"].iloc[-2])
     reentry      = (price > sma20) and (prev_price <= prev_sma20) and above_sma120
-    stop_dist    = (price - trail_stop) / price * 100 if trail_stop else None
     sma120_dist  = (price - sma120) / price * 100
+
     return {
         "price": price, "sma120": sma120, "sma20": sma20, "atr20": atr20, "gap": gap,
         "trail_stop": trail_stop, "stop_dist": stop_dist, "sma120_dist": sma120_dist,
@@ -139,6 +138,25 @@ st.markdown(
     "</style>",
     unsafe_allow_html=True
 )
+
+# ── 버그수정1: JS 공통 함수 최상단 정의 ──
+# sendPopupAlert를 Tab3가 아닌 앱 시작 시 전역으로 정의
+st.markdown("""
+<script>
+// ── 전역 공통 JS (앱 시작 시 즉시 정의) ──
+window.sendPopupAlert = function(title, body) {
+    var mode = localStorage.getItem('popup_mode') || 'off';
+    if(mode === 'off') return;
+    if('Notification' in window && Notification.permission === 'granted') {
+        new Notification(title, {body: body, silent: mode === 'silent'});
+    } else if(Notification.permission !== 'denied') {
+        Notification.requestPermission().then(function(p) {
+            if(p === 'granted') new Notification(title, {body: body, silent: mode === 'silent'});
+        });
+    }
+};
+</script>
+""", unsafe_allow_html=True)
 
 # 자동 새로고침 1분
 try:
@@ -205,7 +223,7 @@ with tab1:
             "<div style='background:#0a1a0a;border:1px solid #1a3020;border-radius:8px;"
             "padding:7px 12px;margin-bottom:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>"
             "<span style='font-size:14px;'>🚨</span>" + sep.join(signals) + "</div>"
-            "<script>" + alert_js + "</script>",
+            "<script>setTimeout(function(){" + alert_js + "},500);</script>",
             unsafe_allow_html=True
         )
     else:
@@ -338,105 +356,81 @@ with tab2:
         sig = data["sig"]
         prices_dict[MARKETS[mkt]["ls_key"]] = sig["price"] if sig else 0
 
-    mkt_list = []
-    for mkt, info in MARKETS.items():
-        mkt_list.append({
-            "key": info["ls_key"],
-            "name": info["emoji"] + " " + mkt,
-            "bg": info["card_bg"],
-            "bd": info["card_bd"],
-            "accent": "#4ade80" if "코스닥" in mkt else ("#fbbf24" if "코스피" in mkt else ("#f87171" if "2차" in mkt else "#818CF8")),
-            "price": prices_dict[info["ls_key"]]
-        })
-
-    prices_js = str(prices_dict).replace("'", '"')
+    prices_js  = str(prices_dict).replace("'", '"')
+    markets_js = str([
+        {"key": info["ls_key"], "name": info["emoji"]+" "+mkt,
+         "bg": info["card_bg"], "bd": info["card_bd"]}
+        for mkt, info in MARKETS.items()
+    ]).replace("'", '"')
 
     st.markdown("""
-    <div id="invest-wrap">
-      <div style="color:#6b7280;font-size:12px;text-align:center;padding:20px;">데이터 로딩 중...</div>
-    </div>
-    <script>
+<div id="invest-wrap">
+  <div style="color:#6b7280;font-size:12px;text-align:center;padding:20px;">데이터 로딩 중...</div>
+</div>
+<script>
+(function(){
+    var prices  = """ + prices_js + """;
+    var markets = """ + markets_js + """;
+
     function fNum(n){ return Math.round(n).toLocaleString('ko-KR'); }
+
     function renderInvest(){
-        const prices = """ + prices_js + """;
-        const markets = """ + str([{"key":info["ls_key"],"name":info["emoji"]+" "+mkt,"bg":info["card_bg"],"bd":info["card_bd"],"price":prices_dict[info["ls_key"]]} for mkt,info in MARKETS.items()]).replace("'",'"') + """;
-        let totalInvest=0, totalCurrent=0, html='';
-        markets.forEach(m => {
-            const amt = parseFloat(localStorage.getItem(m.key+'_amount')||'0');
-            const bp  = parseFloat(localStorage.getItem(m.key+'_buy_price')||'0');
-            const price = m.price || 0;
+        var totalInvest=0, totalCurrent=0, html='';
+        markets.forEach(function(m){
+            var amt   = parseFloat(localStorage.getItem(m.key+'_amount')   || '0');
+            var bp    = parseFloat(localStorage.getItem(m.key+'_buy_price')|| '0');
+            var price = prices[m.key] || 0;
             if(amt>0 && bp>0 && price>0){
-                const shares=Math.floor(amt/bp), invest=shares*bp, current=shares*price;
-                const profit=current-invest, pct=((price-bp)/bp*100).toFixed(1);
+                var shares  = Math.floor(amt/bp);
+                var invest  = shares*bp;
+                var current = shares*price;
+                var profit  = current-invest;
+                var pct     = ((price-bp)/bp*100).toFixed(1);
                 totalInvest+=invest; totalCurrent+=current;
-                const pc=profit>=0?'#4ade80':'#f87171', sg=profit>=0?'+':'';
-                html+=`<div style="background:${m.bg};border:1px solid ${m.bd};border-radius:10px;padding:10px 12px;margin-bottom:7px;">
-                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <span style="color:#e2e8f0;font-size:13px;font-weight:600;">${m.name}</span>
-                    <span style="color:${pc};font-size:13px;font-weight:600;">${sg}${pct}%</span>
-                  </div>
-                  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;">
-                    <div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;">
-                      <div style="font-size:9px;color:#6b7280;margin-bottom:2px;">투자금</div>
-                      <div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩${fNum(invest)}</div>
-                    </div>
-                    <div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;">
-                      <div style="font-size:9px;color:#6b7280;margin-bottom:2px;">평균매수가</div>
-                      <div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩${fNum(bp)}</div>
-                    </div>
-                    <div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;">
-                      <div style="font-size:9px;color:#6b7280;margin-bottom:2px;">보유수량</div>
-                      <div style="font-size:10px;font-weight:600;color:#e2e8f0;">${shares}주</div>
-                    </div>
-                    <div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;">
-                      <div style="font-size:9px;color:#6b7280;margin-bottom:2px;">현재가</div>
-                      <div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩${fNum(price)}</div>
-                    </div>
-                    <div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;">
-                      <div style="font-size:9px;color:#6b7280;margin-bottom:2px;">평가금액</div>
-                      <div style="font-size:10px;font-weight:600;color:${pc};">₩${fNum(current)}</div>
-                    </div>
-                    <div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;">
-                      <div style="font-size:9px;color:#6b7280;margin-bottom:2px;">수익금</div>
-                      <div style="font-size:10px;font-weight:600;color:${pc};">${sg}₩${fNum(profit)}</div>
-                    </div>
-                  </div>
-                </div>`;
+                var pc=profit>=0?'#4ade80':'#f87171', sg=profit>=0?'+':'';
+                html+='<div style="background:'+m.bg+';border:1px solid '+m.bd+';border-radius:10px;padding:10px 12px;margin-bottom:7px;">'
+                    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+                    +'<span style="color:#e2e8f0;font-size:13px;font-weight:600;">'+m.name+'</span>'
+                    +'<span style="color:'+pc+';font-size:13px;font-weight:600;">'+sg+pct+'%</span></div>'
+                    +'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;">'
+                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">투자금</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩'+fNum(invest)+'</div></div>'
+                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">평균매수가</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩'+fNum(bp)+'</div></div>'
+                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">보유수량</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">'+shares+'주</div></div>'
+                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">현재가</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩'+fNum(price)+'</div></div>'
+                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">평가금액</div><div style="font-size:10px;font-weight:600;color:'+pc+';">₩'+fNum(current)+'</div></div>'
+                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">수익금</div><div style="font-size:10px;font-weight:600;color:'+pc+';">'+sg+'₩'+fNum(profit)+'</div></div>'
+                    +'</div></div>';
             } else {
-                html+=`<div style="background:${m.bg};border:1px solid ${m.bd};border-radius:10px;padding:10px 12px;margin-bottom:7px;">
-                  <div style="color:#e2e8f0;font-size:13px;font-weight:600;margin-bottom:4px;">${m.name}</div>
-                  <div style="color:#6b7280;font-size:11px;">투자금액·매수가 미입력 — 설정 탭에서 입력하세요</div>
-                </div>`;
+                html+='<div style="background:'+m.bg+';border:1px solid '+m.bd+';border-radius:10px;padding:10px 12px;margin-bottom:7px;">'
+                    +'<div style="color:#e2e8f0;font-size:13px;font-weight:600;margin-bottom:4px;">'+m.name+'</div>'
+                    +'<div style="color:#6b7280;font-size:11px;">⚙️ 설정 탭에서 투자금액·매수가를 입력하세요</div></div>';
             }
         });
-        const tp=totalCurrent-totalInvest, tpct=totalInvest>0?((tp/totalInvest)*100).toFixed(1):0;
-        const tc=tp>=0?'#4ade80':'#f87171', tsg=tp>=0?'+':'';
-        const summary = totalInvest>0 ? `
-        <div style="background:#111120;border:1px solid #1e2040;border-radius:10px;padding:12px 14px;margin-bottom:12px;">
-          <div style="font-size:10px;color:#6b7280;margin-bottom:8px;">전체 요약</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-            <div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;">
-              <div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 투자금</div>
-              <div style="font-size:13px;font-weight:600;color:#e2e8f0;">₩${fNum(totalInvest)}</div>
-            </div>
-            <div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;">
-              <div style="font-size:9px;color:#6b7280;margin-bottom:3px;">현재 평가금</div>
-              <div style="font-size:13px;font-weight:600;color:${tc};">₩${fNum(totalCurrent)}</div>
-            </div>
-            <div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;">
-              <div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 수익금</div>
-              <div style="font-size:13px;font-weight:600;color:${tc};">${tsg}₩${fNum(tp)}</div>
-            </div>
-            <div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;">
-              <div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 수익률</div>
-              <div style="font-size:13px;font-weight:600;color:${tc};">${tsg}${tpct}%</div>
-            </div>
-          </div>
-        </div>` : '';
+
+        var tp=totalCurrent-totalInvest;
+        var tpct=totalInvest>0?((tp/totalInvest)*100).toFixed(1):0;
+        var tc=tp>=0?'#4ade80':'#f87171', tsg=tp>=0?'+':'';
+        var summary = totalInvest>0
+            ? '<div style="background:#111120;border:1px solid #1e2040;border-radius:10px;padding:12px 14px;margin-bottom:12px;">'
+              +'<div style="font-size:10px;color:#6b7280;margin-bottom:8px;">전체 요약</div>'
+              +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
+              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 투자금</div><div style="font-size:13px;font-weight:600;color:#e2e8f0;">₩'+fNum(totalInvest)+'</div></div>'
+              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">현재 평가금</div><div style="font-size:13px;font-weight:600;color:'+tc+';">₩'+fNum(totalCurrent)+'</div></div>'
+              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 수익금</div><div style="font-size:13px;font-weight:600;color:'+tc+';">'+tsg+'₩'+fNum(tp)+'</div></div>'
+              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 수익률</div><div style="font-size:13px;font-weight:600;color:'+tc+';">'+tsg+tpct+'%</div></div>'
+              +'</div></div>'
+            : '';
         document.getElementById('invest-wrap').innerHTML = summary + html;
     }
-    setTimeout(renderInvest, 600);
-    </script>
+
+    // 탭 전환·새로고침 후에도 안정적으로 로드
+    if(document.readyState === 'loading'){
+        document.addEventListener('DOMContentLoaded', function(){ setTimeout(renderInvest,300); });
+    } else {
+        setTimeout(renderInvest, 300);
+    }
+})();
+</script>
     """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════
@@ -459,108 +453,116 @@ with tab3:
             "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;'>"
             "<div><div style='font-size:9px;color:#9a9ab8;margin-bottom:3px;'>투자금액 (원)</div>"
             "<input id='" + k + "_amount' type='number' placeholder='예: 10000000'"
+            " oninput=\"autoSave('" + k + "_amount',this.value)\""
             " style='width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;"
-            "padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;'></div>"
+            "padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;'></div>"
             "<div><div style='font-size:9px;color:#9a9ab8;margin-bottom:3px;'>평균매수가 (원)</div>"
             "<input id='" + k + "_buy_price' type='number' placeholder='예: 19000'"
+            " oninput=\"autoSave('" + k + "_buy_price',this.value)\""
             " style='width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;"
-            "padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;'></div>"
+            "padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;'></div>"
             "</div></div>"
         )
 
     st.markdown("""
-    <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">👤 사용자 정보</div>
-    <div style="margin-bottom:14px;">
-      <div style="font-size:10px;color:#9a9ab8;margin-bottom:4px;">이름</div>
-      <input id="user_name" type="text" placeholder="이름 입력"
-        style="width:100%;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;color:#e2e8f0;font-size:12px;outline:none;">
-    </div>
+<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">👤 사용자 정보</div>
+<div style="margin-bottom:14px;">
+  <div style="font-size:10px;color:#9a9ab8;margin-bottom:4px;">이름</div>
+  <input id="user_name" type="text" placeholder="이름 입력"
+    oninput="autoSave('user_name',this.value)"
+    style="width:100%;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;color:#e2e8f0;font-size:12px;outline:none;box-sizing:border-box;">
+</div>
 
-    <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">🔔 팝업 알람</div>
-    <div style="margin-bottom:6px;">
-      <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
-        <input type="radio" name="popup" id="popup_off" value="off" style="accent-color:#4ade80;">
-        <span style="color:#e2e8f0;font-size:12px;">끄기</span>
-      </label>
-      <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
-        <input type="radio" name="popup" id="popup_sound" value="sound" style="accent-color:#4ade80;">
-        <span style="color:#e2e8f0;font-size:12px;">켜기 — 소리/진동 (폰 설정 따름)</span>
-      </label>
-      <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
-        <input type="radio" name="popup" id="popup_silent" value="silent" style="accent-color:#4ade80;">
-        <span style="color:#e2e8f0;font-size:12px;">켜기 — 무음 (팝업만)</span>
-      </label>
-    </div>
-    <div style="background:#1a1200;border:1px solid #3a2800;border-radius:6px;padding:8px 10px;margin-bottom:14px;">
-      <div style="color:#fbbf24;font-size:9px;line-height:1.7;">
-        ⚠️ 알람 허용 방법<br>
-        크롬: 설정 → 개인정보 → 사이트 설정 → 알림 → 허용<br>
-        삼성 브라우저: 설정 → 사이트 및 다운로드 → 알림 → 허용
-      </div>
-    </div>
+<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">🔔 팝업 알람</div>
+<div style="margin-bottom:6px;">
+  <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
+    <input type="radio" name="popup" id="popup_off" value="off" onchange="autoSave('popup_mode','off')" style="accent-color:#4ade80;">
+    <span style="color:#e2e8f0;font-size:12px;">끄기</span>
+  </label>
+  <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
+    <input type="radio" name="popup" id="popup_sound" value="sound" onchange="autoSave('popup_mode','sound')" style="accent-color:#4ade80;">
+    <span style="color:#e2e8f0;font-size:12px;">켜기 — 소리/진동 (폰 설정 따름)</span>
+  </label>
+  <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
+    <input type="radio" name="popup" id="popup_silent" value="silent" onchange="autoSave('popup_mode','silent')" style="accent-color:#4ade80;">
+    <span style="color:#e2e8f0;font-size:12px;">켜기 — 무음 (팝업만)</span>
+  </label>
+</div>
+<div style="background:#1a1200;border:1px solid #3a2800;border-radius:6px;padding:8px 10px;margin-bottom:14px;">
+  <div style="color:#fbbf24;font-size:9px;line-height:1.7;">
+    ⚠️ 알람 허용 방법<br>
+    크롬: 설정 → 개인정보 → 사이트 설정 → 알림 → 허용<br>
+    삼성 브라우저: 설정 → 사이트 및 다운로드 → 알림 → 허용
+  </div>
+</div>
 
-    <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">💰 시장별 투자 설정</div>
-    <div style="font-size:10px;color:#9a9ab8;margin-bottom:10px;">투자금액·매수가 입력시 실시간 수익률 자동 계산. 비워두면 모니터링만.</div>
-    """ + mkt_inputs + """
-    <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;margin-top:6px;">🤖 키움증권 API (추후 자동매매)</div>
-    <div style="font-size:10px;color:#9a9ab8;margin-bottom:8px;">지금은 저장만 됩니다. 추후 업데이트 예정.</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">
-      <div>
-        <div style="font-size:9px;color:#9a9ab8;margin-bottom:3px;">키움 HTS ID</div>
-        <input id="kiwoom_id" type="text" placeholder="미입력"
-          style="width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;">
-      </div>
-      <div>
-        <div style="font-size:9px;color:#9a9ab8;margin-bottom:3px;">API Key</div>
-        <input id="kiwoom_key" type="password" placeholder="미입력"
-          style="width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;">
-      </div>
-    </div>
+<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">💰 시장별 투자 설정</div>
+<div style="font-size:10px;color:#9a9ab8;margin-bottom:10px;">입력하면 자동 저장되고 투자현황 탭에서 바로 계산됩니다.</div>
+""" + mkt_inputs + """
 
-    <button onclick="saveAll()"
-      style="width:100%;background:#1a3020;border:1px solid #2a5030;border-radius:8px;padding:10px;color:#4ade80;font-size:13px;font-weight:600;cursor:pointer;">
-      💾 설정 저장
-    </button>
+<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;margin-top:10px;">🤖 키움증권 API (추후 자동매매)</div>
+<div style="font-size:10px;color:#9a9ab8;margin-bottom:8px;">지금은 저장만 됩니다. 추후 업데이트 예정.</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">
+  <div>
+    <div style="font-size:9px;color:#9a9ab8;margin-bottom:3px;">키움 HTS ID</div>
+    <input id="kiwoom_id" type="text" placeholder="미입력"
+      oninput="autoSave('kiwoom_id',this.value)"
+      style="width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;">
+  </div>
+  <div>
+    <div style="font-size:9px;color:#9a9ab8;margin-bottom:3px;">API Key</div>
+    <input id="kiwoom_key" type="password" placeholder="미입력"
+      oninput="autoSave('kiwoom_key',this.value)"
+      style="width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;">
+  </div>
+</div>
 
-    <script>
-    function sendPopupAlert(title, body) {
-        const mode = localStorage.getItem('popup_mode') || 'off';
-        if(mode === 'off') return;
-        if('Notification' in window && Notification.permission === 'granted') {
-            new Notification(title, {body: body, silent: mode === 'silent'});
-        } else if(Notification.permission !== 'denied') {
-            Notification.requestPermission().then(p => {
-                if(p === 'granted') new Notification(title, {body: body, silent: mode === 'silent'});
-            });
-        }
-    }
+<div id="save-status" style="text-align:center;font-size:11px;color:#4ade80;min-height:20px;margin-bottom:8px;"></div>
 
-    function saveAll() {
-        const keys = ['user_name','kosdaq_amount','kosdaq_buy_price',
-            'kospi_amount','kospi_buy_price','battery_amount','battery_buy_price',
-            'semi_amount','semi_buy_price','kiwoom_id','kiwoom_key'];
-        keys.forEach(k => {
-            const el = document.getElementById(k);
-            if(el) localStorage.setItem(k, el.value);
-        });
-        const mode = document.querySelector('input[name=popup]:checked');
-        if(mode) localStorage.setItem('popup_mode', mode.value);
-        alert('✅ 설정이 저장되었습니다!');
-    }
+<script>
+(function(){
+    // ── 버그수정3: 자동저장 + 안정적 로드 ──
+    var ALL_KEYS = ['user_name',
+        'kosdaq_amount','kosdaq_buy_price',
+        'kospi_amount','kospi_buy_price',
+        'battery_amount','battery_buy_price',
+        'semi_amount','semi_buy_price',
+        'kiwoom_id','kiwoom_key'];
+
+    // 입력할 때마다 즉시 저장
+    window.autoSave = function(key, value) {
+        try {
+            localStorage.setItem(key, value);
+            var el = document.getElementById('save-status');
+            if(el){ el.textContent = '✅ 자동 저장됨'; setTimeout(function(){ el.textContent=''; }, 1500); }
+        } catch(e) {}
+    };
+
+    // 라디오 버튼 변경 시 즉시 저장
+    window.autoSave = function(key, value) {
+        try { localStorage.setItem(key, value); } catch(e) {}
+        var el = document.getElementById('save-status');
+        if(el){ el.textContent = '✅ 자동 저장됨'; setTimeout(function(){ el.textContent=''; }, 1500); }
+    };
 
     function loadAll() {
-        const keys = ['user_name','kosdaq_amount','kosdaq_buy_price',
-            'kospi_amount','kospi_buy_price','battery_amount','battery_buy_price',
-            'semi_amount','semi_buy_price','kiwoom_id','kiwoom_key'];
-        keys.forEach(k => {
-            const el = document.getElementById(k);
-            const val = localStorage.getItem(k);
-            if(el && val) el.value = val;
+        ALL_KEYS.forEach(function(k){
+            var el  = document.getElementById(k);
+            var val = localStorage.getItem(k);
+            if(el && val !== null && val !== '') el.value = val;
         });
-        const mode = localStorage.getItem('popup_mode') || 'off';
-        const rb = document.getElementById('popup_' + mode);
+        var mode = localStorage.getItem('popup_mode') || 'off';
+        var rb = document.getElementById('popup_' + mode);
         if(rb) rb.checked = true;
     }
-    setTimeout(loadAll, 400);
-    </script>
+
+    // DOM 준비 후 로드 (탭 전환 시에도 안정적)
+    function tryLoad(retry){
+        var el = document.getElementById('user_name');
+        if(el){ loadAll(); }
+        else if(retry > 0){ setTimeout(function(){ tryLoad(retry-1); }, 200); }
+    }
+    tryLoad(10);
+})();
+</script>
     """, unsafe_allow_html=True)
