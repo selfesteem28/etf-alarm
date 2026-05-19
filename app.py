@@ -1,11 +1,10 @@
 """
-국내 레버리지 ETF 알람 시스템 v2.1
-수정사항:
-  - sendPopupAlert JS 함수 최상단 정의 (알람 먹통 버그 수정)
-  - trail_stop 계산 로직 수정 (peak 기반 단순 계산)
-  - localStorage 저장/로드 안정화 (껐다 켜도 유지)
-  - 설정값 Tab2 자동 계산 연동
+국내 레버리지 ETF 알람 시스템 v3.0
+- Tab1: 대시보드 (실시간 신호)
+- Tab2: 투자현황 (거래시작일~오늘 시뮬, 다음날 시가 기준)
+- Tab3: 설정 (팝업알람 + 시장별 투자금/거래시작일)
 """
+
 
 import streamlit as st
 import yfinance as yf
@@ -45,6 +44,12 @@ MARKETS = {
     },
 }
 
+COMMISSION = 0.0005  # 편도 0.05%
+
+# ══════════════════════════════════════════════════════════
+# 공통 함수
+# ══════════════════════════════════════════════════════════
+
 def get_naver_price(code):
     try:
         url = "https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:" + code
@@ -66,11 +71,12 @@ def load_history(code):
         close = df["Close"].squeeze()
         high  = df["High"].squeeze()
         low   = df["Low"].squeeze()
-        r = pd.DataFrame({"price": close, "high": high, "low": low})
+        open_ = df["Open"].squeeze()
+        r = pd.DataFrame({"price": close, "high": high, "low": low, "open": open_})
         r["SMA120"] = r["price"].rolling(120).mean()
         r["SMA20"]  = r["price"].rolling(20).mean()
         prev = r["price"].shift(1)
-        tr = pd.concat([r["high"]-r["low"],(r["high"]-prev).abs(),(r["low"]-prev).abs()], axis=1).max(axis=1)
+        tr = pd.concat([r["high"]-r["low"], (r["high"]-prev).abs(), (r["low"]-prev).abs()], axis=1).max(axis=1)
         r["ATR20"] = tr.rolling(20).mean()
         return r.dropna()
     except:
@@ -85,8 +91,7 @@ def calc_signal(df, rt_price=None):
     atr20  = float(df["ATR20"].iloc[-1])
     gap    = (price - sma120) / sma120 * 100
 
-    # ── trail_stop 수정: 최근 120일 고점 기준 단순 계산 ──
-    recent_high = float(df["price"].tail(120).max())
+    recent_high = float(df["high"].tail(120).max())
     trail_stop  = recent_high - atr20 * 2.0 if gap > 20 else None
     stop_dist   = (price - trail_stop) / price * 100 if trail_stop else None
 
@@ -125,7 +130,154 @@ def get_pre_alerts(sig):
         elif 2  < sma_dist <= 5:  alerts.append({"level":"D-2","msg":"SMA120까지 " + str(round(sma_dist,1)) + "%","kind":"sell"})
     return alerts
 
-# ── CSS ──
+# ══════════════════════════════════════════════════════════
+# Tab2 시뮬레이션 (다음날 시가 기준)
+# ══════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600)
+def run_simulation(signal_code, trade_code, start_date_str, initial_amount):
+    # SMA120 워밍업을 위해 시작일 200일 전부터 로드
+    start_dt   = datetime.strptime(start_date_str, "%Y-%m-%d")
+    data_start = (start_dt - timedelta(days=200)).strftime("%Y-%m-%d")
+
+    try:
+        sig_raw   = yf.download(signal_code + ".KS", start=data_start, auto_adjust=True, progress=False)
+        trade_raw = yf.download(trade_code  + ".KS", start=data_start, auto_adjust=True, progress=False)
+    except:
+        return [], None
+
+    if sig_raw.empty or trade_raw.empty:
+        return [], None
+
+    def flatten(df):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df
+
+    sig_raw   = flatten(sig_raw)
+    trade_raw = flatten(trade_raw)
+
+    common   = sig_raw.index.intersection(trade_raw.index)
+    sig_df   = sig_raw.loc[common]
+    trade_df = trade_raw.loc[common]
+
+    c      = sig_df["Close"]
+    h      = sig_df["High"]
+    l      = sig_df["Low"]
+    sma120 = c.rolling(120).mean()
+    sma20  = c.rolling(20).mean()
+    prev_c = c.shift(1)
+    tr     = pd.concat([h-l, (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+    atr20  = tr.rolling(20).mean()
+    peak120 = h.rolling(120).max()
+    trail_s = peak120 - atr20 * 2.0
+
+    start_idx = sig_df.index.searchsorted(pd.Timestamp(start_date_str))
+    start_idx = max(start_idx, 121)
+
+    trades     = []
+    cash       = initial_amount
+    shares     = 0.0
+    avg_price  = 0.0
+    in_market  = False
+    hold_trail = 0.0
+
+    dates = sig_df.index
+
+    for i in range(start_idx, len(dates) - 1):
+        price_now = float(c.iloc[i])
+        sl        = float(sma120.iloc[i])
+        ss        = float(sma20.iloc[i])
+        atr_v     = float(atr20.iloc[i])
+        trail_v   = float(trail_s.iloc[i])
+
+        if np.isnan(sl) or np.isnan(atr_v):
+            continue
+
+        gap          = (price_now - sl) / sl * 100
+        above_sma120 = price_now > sl
+
+        buy_signal = above_sma120 and (0 < gap <= 15) and not in_market
+        sma_sell   = (not above_sma120) and in_market
+        atr_sell   = in_market and (gap > 20) and (price_now < hold_trail)
+        prev_p     = float(c.iloc[i-1])
+        prev_ss    = float(sma20.iloc[i-1])
+        reentry    = (not in_market) and above_sma120 and (price_now > ss) and (prev_p <= prev_ss)
+
+        exec_price = float(trade_df["Open"].iloc[i + 1])
+        exec_date  = dates[i + 1].strftime("%Y-%m-%d")
+
+        if buy_signal or reentry:
+            cost      = exec_price * (1 + COMMISSION)
+            shares    = cash / cost
+            avg_price = exec_price
+            cash      = 0.0
+            in_market = True
+            hold_trail = trail_v
+            reason = "매수" if buy_signal else "재진입"
+            trades.append({
+                "날짜":      exec_date,
+                "구분":      "🔴 " + reason,
+                "SMA120":   round(sl, 0),
+                "GAP%":     round(gap, 1),
+                "체결가":    round(exec_price, 0),
+                "주수":      round(shares, 2),
+                "평균단가":  round(avg_price, 0),
+                "잔고(원)":  round(shares * exec_price, 0),
+                "매매수익률": "-",
+            })
+
+        elif sma_sell or atr_sell:
+            proceeds = shares * exec_price * (1 - COMMISSION)
+            pnl_pct  = (exec_price - avg_price) / avg_price * 100
+            reason   = "SMA매도" if sma_sell else "ATR매도"
+            trades.append({
+                "날짜":      exec_date,
+                "구분":      "🔵 " + reason,
+                "SMA120":   round(sl, 0),
+                "GAP%":     round(gap, 1),
+                "체결가":    round(exec_price, 0),
+                "주수":      round(shares, 2),
+                "평균단가":  round(avg_price, 0),
+                "잔고(원)":  round(proceeds, 0),
+                "매매수익률": f"{pnl_pct:+.2f}%",
+            })
+            cash      = proceeds
+            shares    = 0.0
+            avg_price = 0.0
+            in_market = False
+            hold_trail = 0.0
+
+        if in_market:
+            hold_trail = max(hold_trail, trail_v)
+
+    last_price = float(trade_df["Close"].iloc[-1]) if not trade_df.empty else 0
+    if in_market and avg_price > 0:
+        current_value = shares * last_price
+        pnl_pct = (last_price - avg_price) / avg_price * 100
+        position = {
+            "상태":     "보유중",
+            "보유주수": round(shares, 2),
+            "평균단가": round(avg_price, 0),
+            "현재가":   round(last_price, 0),
+            "평가금액": round(current_value, 0),
+            "수익률":   round(pnl_pct, 2),
+            "ATR스탑":  round(hold_trail, 0),
+        }
+    else:
+        pnl_total = (cash - initial_amount) / initial_amount * 100
+        position = {
+            "상태":   "현금대기",
+            "현금":   round(cash, 0),
+            "수익률": round(pnl_total, 2),
+        }
+
+    return trades, position
+
+
+# ══════════════════════════════════════════════════════════
+# Streamlit 앱
+# ══════════════════════════════════════════════════════════
+
 st.set_page_config(page_title="국내 ETF 알람", page_icon="📈", layout="wide")
 st.markdown(
     "<style>"
@@ -139,11 +291,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# ── 버그수정1: JS 공통 함수 최상단 정의 ──
-# sendPopupAlert를 Tab3가 아닌 앱 시작 시 전역으로 정의
 st.markdown("""
 <script>
-// ── 전역 공통 JS (앱 시작 시 즉시 정의) ──
 window.sendPopupAlert = function(title, body) {
     var mode = localStorage.getItem('popup_mode') || 'off';
     if(mode === 'off') return;
@@ -158,7 +307,6 @@ window.sendPopupAlert = function(title, body) {
 </script>
 """, unsafe_allow_html=True)
 
-# 자동 새로고침 1분
 try:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=60000, key="autorefresh")
@@ -183,9 +331,9 @@ with st.spinner("📡 네이버 실시간 데이터 로딩 중..."):
 
 tab1, tab2, tab3 = st.tabs(["📱 대시보드", "💰 투자현황", "⚙️ 설정"])
 
-# ══════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # TAB 1: 대시보드
-# ══════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 with tab1:
     st.markdown(
         "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;'>"
@@ -199,7 +347,7 @@ with tab1:
         unsafe_allow_html=True
     )
 
-    signals = []
+    signals  = []
     alert_js = ""
     for mkt, data in all_data.items():
         sig = data["sig"]
@@ -340,140 +488,175 @@ with tab1:
         st.cache_data.clear()
         st.rerun()
 
-# ══════════════════════════════════════════
-# TAB 2: 투자현황
-# ══════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# TAB 2: 투자현황 (시뮬레이션)
+# ══════════════════════════════════════════════════════════
 with tab2:
     st.markdown(
         "<div style='color:#e2e8f0;font-size:17px;font-weight:600;margin-bottom:2px;'>💰 투자현황</div>"
-        "<div style='font-size:10px;color:#9a9ab8;margin-bottom:12px;'>"
-        "실시간 수익률 | <span style='color:#e2e8f0;font-weight:700;'>" + now_str + " KST</span></div>",
+        "<div style='font-size:10px;color:#9a9ab8;margin-bottom:10px;'>"
+        "전략 신호(종가) → 다음날 시가 체결 기준 | "
+        "<span style='color:#e2e8f0;font-weight:700;'>" + now_str + " KST</span></div>",
         unsafe_allow_html=True
     )
 
-    prices_dict = {}
-    for mkt, data in all_data.items():
-        sig = data["sig"]
-        prices_dict[MARKETS[mkt]["ls_key"]] = sig["price"] if sig else 0
+    total_invest  = 0
+    total_current = 0
+    any_configured = False
 
-    prices_js  = str(prices_dict).replace("'", '"')
-    markets_js = str([
-        {"key": info["ls_key"], "name": info["emoji"]+" "+mkt,
-         "bg": info["card_bg"], "bd": info["card_bd"]}
-        for mkt, info in MARKETS.items()
-    ]).replace("'", '"')
+    for mkt, info in MARKETS.items():
+        k          = info["ls_key"]
+        start_val  = st.session_state.get(f"cfg_{k}_start",  None)
+        amount_val = st.session_state.get(f"cfg_{k}_amount", 0)
+        info_bg    = info["card_bg"]
+        info_bd    = info["card_bd"]
 
-    st.markdown("""
-<div id="invest-wrap">
-  <div style="color:#6b7280;font-size:12px;text-align:center;padding:20px;">데이터 로딩 중...</div>
-</div>
-<script>
-(function(){
-    var prices  = """ + prices_js + """;
-    var markets = """ + markets_js + """;
+        if not start_val or not amount_val or amount_val == 0:
+            st.markdown(
+                f"<div style='background:{info_bg};border:1px solid {info_bd};"
+                f"border-radius:10px;padding:10px 12px;margin-bottom:8px;'>"
+                f"<div style='color:#e2e8f0;font-size:13px;font-weight:600;margin-bottom:4px;'>"
+                f"{info['emoji']} {mkt}</div>"
+                f"<div style='color:#6b7280;font-size:11px;'>⚙️ 설정 탭에서 거래시작일과 투자금을 입력하세요</div></div>",
+                unsafe_allow_html=True
+            )
+            continue
 
-    function fNum(n){ return Math.round(n).toLocaleString('ko-KR'); }
+        any_configured = True
+        with st.spinner(f"{mkt} 시뮬 계산 중..."):
+            trades, position = run_simulation(
+                info["signal_code"], info["trade_code"],
+                start_val.strftime("%Y-%m-%d"), float(amount_val)
+            )
 
-    function renderInvest(){
-        var totalInvest=0, totalCurrent=0, html='';
-        markets.forEach(function(m){
-            var amt   = parseFloat(localStorage.getItem(m.key+'_amount')   || '0');
-            var bp    = parseFloat(localStorage.getItem(m.key+'_buy_price')|| '0');
-            var price = prices[m.key] || 0;
-            if(amt>0 && bp>0 && price>0){
-                var shares  = Math.floor(amt/bp);
-                var invest  = shares*bp;
-                var current = shares*price;
-                var profit  = current-invest;
-                var pct     = ((price-bp)/bp*100).toFixed(1);
-                totalInvest+=invest; totalCurrent+=current;
-                var pc=profit>=0?'#4ade80':'#f87171', sg=profit>=0?'+':'';
-                html+='<div style="background:'+m.bg+';border:1px solid '+m.bd+';border-radius:10px;padding:10px 12px;margin-bottom:7px;">'
-                    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
-                    +'<span style="color:#e2e8f0;font-size:13px;font-weight:600;">'+m.name+'</span>'
-                    +'<span style="color:'+pc+';font-size:13px;font-weight:600;">'+sg+pct+'%</span></div>'
-                    +'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;">'
-                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">투자금</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩'+fNum(invest)+'</div></div>'
-                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">평균매수가</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩'+fNum(bp)+'</div></div>'
-                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">보유수량</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">'+shares+'주</div></div>'
-                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">현재가</div><div style="font-size:10px;font-weight:600;color:#e2e8f0;">₩'+fNum(price)+'</div></div>'
-                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">평가금액</div><div style="font-size:10px;font-weight:600;color:'+pc+';">₩'+fNum(current)+'</div></div>'
-                    +'<div style="background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:2px;">수익금</div><div style="font-size:10px;font-weight:600;color:'+pc+';">'+sg+'₩'+fNum(profit)+'</div></div>'
-                    +'</div></div>';
-            } else {
-                html+='<div style="background:'+m.bg+';border:1px solid '+m.bd+';border-radius:10px;padding:10px 12px;margin-bottom:7px;">'
-                    +'<div style="color:#e2e8f0;font-size:13px;font-weight:600;margin-bottom:4px;">'+m.name+'</div>'
-                    +'<div style="color:#6b7280;font-size:11px;">⚙️ 설정 탭에서 투자금액·매수가를 입력하세요</div></div>';
-            }
-        });
+        if position is None:
+            st.markdown(
+                f"<div style='background:{info_bg};border:1px solid {info_bd};"
+                f"border-radius:10px;padding:10px 12px;margin-bottom:8px;'>"
+                f"<div style='color:#e2e8f0;font-size:13px;font-weight:600;'>{info['emoji']} {mkt}</div>"
+                f"<div style='color:#f87171;font-size:11px;'>데이터 오류 — 잠시 후 다시 시도하세요</div></div>",
+                unsafe_allow_html=True
+            )
+            continue
 
-        var tp=totalCurrent-totalInvest;
-        var tpct=totalInvest>0?((tp/totalInvest)*100).toFixed(1):0;
-        var tc=tp>=0?'#4ade80':'#f87171', tsg=tp>=0?'+':'';
-        var summary = totalInvest>0
-            ? '<div style="background:#111120;border:1px solid #1e2040;border-radius:10px;padding:12px 14px;margin-bottom:12px;">'
-              +'<div style="font-size:10px;color:#6b7280;margin-bottom:8px;">전체 요약</div>'
-              +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
-              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 투자금</div><div style="font-size:13px;font-weight:600;color:#e2e8f0;">₩'+fNum(totalInvest)+'</div></div>'
-              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">현재 평가금</div><div style="font-size:13px;font-weight:600;color:'+tc+';">₩'+fNum(totalCurrent)+'</div></div>'
-              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 수익금</div><div style="font-size:13px;font-weight:600;color:'+tc+';">'+tsg+'₩'+fNum(tp)+'</div></div>'
-              +'<div style="background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:9px;color:#6b7280;margin-bottom:3px;">총 수익률</div><div style="font-size:13px;font-weight:600;color:'+tc+';">'+tsg+tpct+'%</div></div>'
-              +'</div></div>'
-            : '';
-        document.getElementById('invest-wrap').innerHTML = summary + html;
-    }
+        pnl     = position["수익률"]
+        pnl_col = "#4ade80" if pnl >= 0 else "#f87171"
+        pnl_s   = f"{pnl:+.2f}%"
 
-    // 탭 전환·새로고침 후에도 안정적으로 로드
-    if(document.readyState === 'loading'){
-        document.addEventListener('DOMContentLoaded', function(){ setTimeout(renderInvest,300); });
-    } else {
-        setTimeout(renderInvest, 300);
-    }
-})();
-</script>
-    """, unsafe_allow_html=True)
+        if position["상태"] == "보유중":
+            total_invest  += float(amount_val)
+            total_current += position["평가금액"]
+            status_html = (
+                f"<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:6px;'>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>상태</div>"
+                f"<div style='font-size:11px;font-weight:600;color:#4ade80;'>🔴 보유중</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>보유주수</div>"
+                f"<div style='font-size:11px;font-weight:600;color:#e2e8f0;'>{position['보유주수']:,.2f}주</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>평균단가</div>"
+                f"<div style='font-size:11px;font-weight:600;color:#e2e8f0;'>₩{position['평균단가']:,.0f}</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>현재가</div>"
+                f"<div style='font-size:11px;font-weight:600;color:#e2e8f0;'>₩{position['현재가']:,.0f}</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>평가금액</div>"
+                f"<div style='font-size:11px;font-weight:600;color:{pnl_col};'>₩{position['평가금액']:,.0f}</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>수익률</div>"
+                f"<div style='font-size:14px;font-weight:700;color:{pnl_col};'>{pnl_s}</div></div></div>"
+                f"<div style='font-size:9px;color:#fbbf24;padding-bottom:6px;'>ATR스탑: ₩{position['ATR스탑']:,.0f}</div>"
+            )
+        else:
+            total_invest  += float(amount_val)
+            total_current += position["현금"]
+            status_html = (
+                f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:6px;'>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>상태</div>"
+                f"<div style='font-size:11px;font-weight:600;color:#94a3b8;'>⬜ 현금대기</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>현금</div>"
+                f"<div style='font-size:11px;font-weight:600;color:#e2e8f0;'>₩{position['현금']:,.0f}</div></div>"
+                f"<div style='background:#0a0a1a;border-radius:6px;padding:6px 4px;text-align:center;grid-column:span 2;'>"
+                f"<div style='font-size:8px;color:#6b7280;margin-bottom:2px;'>누적수익률</div>"
+                f"<div style='font-size:14px;font-weight:700;color:{pnl_col};'>{pnl_s}</div></div></div>"
+            )
 
-# ══════════════════════════════════════════
+        st.markdown(
+            f"<div style='background:{info_bg};border:1px solid {info_bd};"
+            f"border-radius:10px;padding:10px 12px;margin-bottom:8px;'>"
+            f"<div style='color:#e2e8f0;font-size:13px;font-weight:600;margin-bottom:6px;'>"
+            f"{info['emoji']} {mkt}</div>"
+            + status_html + "</div>",
+            unsafe_allow_html=True
+        )
+
+        if trades:
+            with st.expander(f"  {mkt} 거래 내역 ({len(trades)}건)", expanded=False):
+                df_t = pd.DataFrame(trades)
+                st.dataframe(
+                    df_t,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "날짜":      st.column_config.TextColumn("날짜",     width=95),
+                        "구분":      st.column_config.TextColumn("구분",     width=80),
+                        "SMA120":    st.column_config.NumberColumn("SMA120", format="₩%,.0f"),
+                        "GAP%":      st.column_config.NumberColumn("GAP%",   format="%.1f%%"),
+                        "체결가":    st.column_config.NumberColumn("체결가",  format="₩%,.0f"),
+                        "주수":      st.column_config.NumberColumn("주수",    format="%.2f"),
+                        "평균단가":  st.column_config.NumberColumn("평균단가",format="₩%,.0f"),
+                        "잔고(원)":  st.column_config.NumberColumn("잔고",    format="₩%,.0f"),
+                        "매매수익률":st.column_config.TextColumn("수익률",   width=70),
+                    }
+                )
+
+    # 전체 요약
+    if total_invest > 0:
+        tp   = total_current - total_invest
+        tpct = tp / total_invest * 100
+        tc   = "#4ade80" if tp >= 0 else "#f87171"
+        tsg  = "+" if tp >= 0 else ""
+        st.markdown(
+            f"<div style='background:#111120;border:1px solid #1e2040;border-radius:10px;"
+            f"padding:12px 14px;margin-top:4px;'>"
+            f"<div style='font-size:10px;color:#6b7280;margin-bottom:8px;'>📊 전체 요약</div>"
+            f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;'>"
+            f"<div style='background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;'>"
+            f"<div style='font-size:9px;color:#6b7280;margin-bottom:3px;'>총 투자금</div>"
+            f"<div style='font-size:13px;font-weight:600;color:#e2e8f0;'>₩{total_invest:,.0f}</div></div>"
+            f"<div style='background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;'>"
+            f"<div style='font-size:9px;color:#6b7280;margin-bottom:3px;'>현재 평가금</div>"
+            f"<div style='font-size:13px;font-weight:600;color:{tc};'>₩{total_current:,.0f}</div></div>"
+            f"<div style='background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;'>"
+            f"<div style='font-size:9px;color:#6b7280;margin-bottom:3px;'>총 수익금</div>"
+            f"<div style='font-size:13px;font-weight:600;color:{tc};'>{tsg}₩{abs(tp):,.0f}</div></div>"
+            f"<div style='background:#0a0a1a;border-radius:8px;padding:8px;text-align:center;'>"
+            f"<div style='font-size:9px;color:#6b7280;margin-bottom:3px;'>총 수익률</div>"
+            f"<div style='font-size:15px;font-weight:700;color:{tc};'>{tsg}{tpct:.2f}%</div></div>"
+            f"</div></div>",
+            unsafe_allow_html=True
+        )
+
+# ══════════════════════════════════════════════════════════
 # TAB 3: 설정
-# ══════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 with tab3:
     st.markdown(
         "<div style='color:#e2e8f0;font-size:17px;font-weight:600;margin-bottom:2px;'>⚙️ 설정</div>"
-        "<div style='font-size:10px;color:#9a9ab8;margin-bottom:12px;'>설정은 이 브라우저에 저장됩니다 (창 닫아도 유지)</div>",
+        "<div style='font-size:10px;color:#9a9ab8;margin-bottom:12px;'>설정은 이 브라우저에 저장됩니다</div>",
         unsafe_allow_html=True
     )
 
-    mkt_inputs = ""
-    for mkt, info in MARKETS.items():
-        k = info["ls_key"]
-        mkt_inputs += (
-            "<div style='background:#111120;border:1px solid #1e2040;border-radius:8px;padding:9px 11px;margin-bottom:7px;'>"
-            "<div style='color:#e2e8f0;font-size:12px;font-weight:600;margin-bottom:7px;'>"
-            + info["emoji"] + " " + mkt + " — " + info["name_trade"] + " (" + info["trade_code"] + ")</div>"
-            "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;'>"
-            "<div><div style='font-size:9px;color:#9a9ab8;margin-bottom:3px;'>투자금액 (원)</div>"
-            "<input id='" + k + "_amount' type='number' placeholder='예: 10000000'"
-            " oninput=\"autoSave('" + k + "_amount',this.value)\""
-            " style='width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;"
-            "padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;'></div>"
-            "<div><div style='font-size:9px;color:#9a9ab8;margin-bottom:3px;'>평균매수가 (원)</div>"
-            "<input id='" + k + "_buy_price' type='number' placeholder='예: 19000'"
-            " oninput=\"autoSave('" + k + "_buy_price',this.value)\""
-            " style='width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;"
-            "padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;'></div>"
-            "</div></div>"
-        )
-
+    # 팝업 알람
+    st.markdown(
+        "<div style='font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;"
+        "padding-bottom:5px;border-bottom:1px solid #1e2040;'>🔔 팝업 알람</div>",
+        unsafe_allow_html=True
+    )
     st.markdown("""
-<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">👤 사용자 정보</div>
-<div style="margin-bottom:14px;">
-  <div style="font-size:10px;color:#9a9ab8;margin-bottom:4px;">이름</div>
-  <input id="user_name" type="text" placeholder="이름 입력"
-    oninput="autoSave('user_name',this.value)"
-    style="width:100%;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;color:#e2e8f0;font-size:12px;outline:none;box-sizing:border-box;">
-</div>
-
-<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">🔔 팝업 알람</div>
 <div style="margin-bottom:6px;">
   <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
     <input type="radio" name="popup" id="popup_off" value="off" onchange="autoSave('popup_mode','off')" style="accent-color:#4ade80;">
@@ -481,85 +664,77 @@ with tab3:
   </label>
   <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
     <input type="radio" name="popup" id="popup_sound" value="sound" onchange="autoSave('popup_mode','sound')" style="accent-color:#4ade80;">
-    <span style="color:#e2e8f0;font-size:12px;">켜기 — 소리/진동 (폰 설정 따름)</span>
+    <span style="color:#e2e8f0;font-size:12px;">켜기 — 소리/진동</span>
   </label>
   <label style="display:flex;align-items:center;gap:8px;background:#111120;border:1px solid #1e2040;border-radius:6px;padding:8px 10px;cursor:pointer;margin-bottom:5px;">
     <input type="radio" name="popup" id="popup_silent" value="silent" onchange="autoSave('popup_mode','silent')" style="accent-color:#4ade80;">
     <span style="color:#e2e8f0;font-size:12px;">켜기 — 무음 (팝업만)</span>
   </label>
 </div>
-<div style="background:#1a1200;border:1px solid #3a2800;border-radius:6px;padding:8px 10px;margin-bottom:14px;">
+<div style="background:#1a1200;border:1px solid #3a2800;border-radius:6px;padding:8px 10px;margin-bottom:16px;">
   <div style="color:#fbbf24;font-size:9px;line-height:1.7;">
-    ⚠️ 알람 허용 방법<br>
-    크롬: 설정 → 개인정보 → 사이트 설정 → 알림 → 허용<br>
-    삼성 브라우저: 설정 → 사이트 및 다운로드 → 알림 → 허용
+    ⚠️ 알람 허용: 크롬 → 설정 → 사이트 설정 → 알림 → 허용
   </div>
 </div>
+    """, unsafe_allow_html=True)
 
-<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;">💰 시장별 투자 설정</div>
-<div style="font-size:10px;color:#9a9ab8;margin-bottom:10px;">입력하면 자동 저장되고 투자현황 탭에서 바로 계산됩니다.</div>
-""" + mkt_inputs + """
+    # 시장별 투자 설정
+    st.markdown(
+        "<div style='font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:4px;"
+        "padding-bottom:5px;border-bottom:1px solid #1e2040;'>💰 시장별 투자 설정</div>"
+        "<div style='font-size:10px;color:#9a9ab8;margin-bottom:10px;'>"
+        "거래 시작일 + 투자금 입력 → 저장 → 투자현황 탭에서 시뮬 결과 확인</div>",
+        unsafe_allow_html=True
+    )
 
-<div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #1e2040;margin-top:10px;">🤖 키움증권 API (추후 자동매매)</div>
-<div style="font-size:10px;color:#9a9ab8;margin-bottom:8px;">지금은 저장만 됩니다. 추후 업데이트 예정.</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">
-  <div>
-    <div style="font-size:9px;color:#9a9ab8;margin-bottom:3px;">키움 HTS ID</div>
-    <input id="kiwoom_id" type="text" placeholder="미입력"
-      oninput="autoSave('kiwoom_id',this.value)"
-      style="width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;">
-  </div>
-  <div>
-    <div style="font-size:9px;color:#9a9ab8;margin-bottom:3px;">API Key</div>
-    <input id="kiwoom_key" type="password" placeholder="미입력"
-      oninput="autoSave('kiwoom_key',this.value)"
-      style="width:100%;background:#0a0a1a;border:1px solid #1e2040;border-radius:5px;padding:6px 8px;color:#e2e8f0;font-size:11px;outline:none;box-sizing:border-box;">
-  </div>
-</div>
+    with st.form("settings_form"):
+        cfg = {}
+        for mkt, info in MARKETS.items():
+            k = info["ls_key"]
+            st.markdown(
+                f"<div style='color:#e2e8f0;font-size:12px;font-weight:600;margin-bottom:4px;margin-top:4px;'>"
+                f"{info['emoji']} {mkt}</div>",
+                unsafe_allow_html=True
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                # 기존 session_state 값 있으면 기본값으로 사용
+                default_start = st.session_state.get(f"cfg_{k}_start", datetime(2024, 1, 2).date())
+                cfg[f"{k}_start"] = st.date_input(
+                    "거래 시작일", value=default_start, key=f"fi_{k}_start"
+                )
+            with c2:
+                default_amt = st.session_state.get(f"cfg_{k}_amount", 0)
+                cfg[f"{k}_amount"] = st.number_input(
+                    "투자금 (원)", min_value=0, max_value=100000000,
+                    value=int(default_amt), step=1000000, key=f"fi_{k}_amount"
+                )
+            st.markdown("<div style='margin-bottom:4px;'></div>", unsafe_allow_html=True)
 
-<div id="save-status" style="text-align:center;font-size:11px;color:#4ade80;min-height:20px;margin-bottom:8px;"></div>
+        submitted = st.form_submit_button("💾 저장 후 시뮬레이션", use_container_width=True)
+        if submitted:
+            for mkt, info in MARKETS.items():
+                k = info["ls_key"]
+                st.session_state[f"cfg_{k}_start"]  = cfg[f"{k}_start"]
+                st.session_state[f"cfg_{k}_amount"] = cfg[f"{k}_amount"]
+            run_simulation.clear()
+            st.success("✅ 저장 완료! 투자현황 탭에서 결과를 확인하세요")
 
+    # 팝업 로드 JS
+    st.markdown("""
 <script>
 (function(){
-    // ── 버그수정3: 자동저장 + 안정적 로드 ──
-    var ALL_KEYS = ['user_name',
-        'kosdaq_amount','kosdaq_buy_price',
-        'kospi_amount','kospi_buy_price',
-        'battery_amount','battery_buy_price',
-        'semi_amount','semi_buy_price',
-        'kiwoom_id','kiwoom_key'];
-
-    // 입력할 때마다 즉시 저장
-    window.autoSave = function(key, value) {
-        try {
-            localStorage.setItem(key, value);
-            var el = document.getElementById('save-status');
-            if(el){ el.textContent = '✅ 자동 저장됨'; setTimeout(function(){ el.textContent=''; }, 1500); }
-        } catch(e) {}
-    };
-
-    // 라디오 버튼 변경 시 즉시 저장
     window.autoSave = function(key, value) {
         try { localStorage.setItem(key, value); } catch(e) {}
-        var el = document.getElementById('save-status');
-        if(el){ el.textContent = '✅ 자동 저장됨'; setTimeout(function(){ el.textContent=''; }, 1500); }
     };
-
-    function loadAll() {
-        ALL_KEYS.forEach(function(k){
-            var el  = document.getElementById(k);
-            var val = localStorage.getItem(k);
-            if(el && val !== null && val !== '') el.value = val;
-        });
+    function loadPopup() {
         var mode = localStorage.getItem('popup_mode') || 'off';
         var rb = document.getElementById('popup_' + mode);
         if(rb) rb.checked = true;
     }
-
-    // DOM 준비 후 로드 (탭 전환 시에도 안정적)
     function tryLoad(retry){
-        var el = document.getElementById('user_name');
-        if(el){ loadAll(); }
+        var el = document.getElementById('popup_off');
+        if(el){ loadPopup(); }
         else if(retry > 0){ setTimeout(function(){ tryLoad(retry-1); }, 200); }
     }
     tryLoad(10);
