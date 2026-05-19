@@ -2,10 +2,10 @@ name: ETF 알람 텔레그램 봇
 
 on:
   schedule:
-    # 장중 1분마다 실행 (KST 09:00~15:30 = UTC 00:00~06:30)
-    - cron: '* 0-6 * * 1-5'
+    # 장중 5분마다 실행 (KST 09:00~15:30 = UTC 00:00~06:30)
+    - cron: '*/5 0-6 * * 1-5'
   workflow_dispatch:  # 수동 실행 가능
-
+  
 jobs:
   check-signals:
     runs-on: ubuntu-latest
