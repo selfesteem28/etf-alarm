@@ -2,15 +2,14 @@ name: ETF 알람 텔레그램 봇
 
 on:
   schedule:
-    # 장중 5분마다 실행 (KST 09:00~15:30 = UTC 00:00~06:30)
-    - cron: '*/5 0-6 * * 1-5'
-  workflow_dispatch:  # 수동 실행 가능
-  
+    - cron: '5,35 0-6 * * 1-5'
+  workflow_dispatch:
+
 jobs:
   check-signals:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 파일 커밋 권한
+      contents: write
 
     steps:
       - name: 코드 체크아웃
@@ -30,7 +29,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python telegram_alert.py
 
-      - name: 신호 상태 저장 (signal_state.json 커밋)
+      - name: 신호 상태 저장
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
