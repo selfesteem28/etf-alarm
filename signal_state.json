@@ -1,10 +1,10 @@
 {
-  "코스닥_signal": "D-1_sell",
+  "코스닥_signal": "SMA매도",
   "코스닥_count": 1,
   "코스피_signal": "ATR매도",
-  "코스피_count": 1,
+  "코스피_count": 2,
   "2차전지_signal": "매수",
-  "2차전지_count": 2,
+  "2차전지_count": 3,
   "반도체_signal": "ATR매도",
-  "반도체_count": 1
+  "반도체_count": 2
 }
