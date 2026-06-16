@@ -1,6 +1,6 @@
 {
   "코스닥_signal": "SMA매도",
-  "코스닥_count": 1,
+  "코스닥_count": 2,
   "코스피_signal": "D-3_sell",
   "코스피_count": 1,
   "2차전지_signal": "D-2_sell",
