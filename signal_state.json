@@ -3,7 +3,7 @@
   "코스닥_count": 3,
   "코스피_signal": "D-3_sell",
   "코스피_count": 1,
-  "2차전지_signal": "D-2_sell",
+  "2차전지_signal": "SMA매도",
   "2차전지_count": 1,
   "반도체_signal": "대기",
   "반도체_count": 0
