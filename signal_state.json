@@ -5,6 +5,6 @@
   "코스피_count": 3,
   "2차전지_signal": "SMA매도",
   "2차전지_count": 3,
-  "반도체_signal": "매수",
+  "반도체_signal": "D-2_sell",
   "반도체_count": 1
 }
